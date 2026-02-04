@@ -8,11 +8,54 @@ const {
   extractQuizScoresByUser,
 } = require('./utils');
 
+const QUESTION_LIST = [ // streamlined for SP26
+  { code: 'employ', prompt: "What is your employment status?", choiceType: "employment" },
+  { code: 'numcourse', prompt: "How many courses are you enrolled in this semester?", choiceType: "enrollCourse" },
+  { code: 'comit1', prompt: "Do you have ongoing family or caregiving responsibilities this semester?", choiceType: "boolean" },
+  { code: 'comit2', prompt: "Are you involved in any extracurricular activities (e.g. athletics, clubs, student government)?", choiceType: "boolean" },
+  { code: 'fin', prompt: "Does your financial situation feel manageable this semester?", choiceType: "boolean" },
+  { code: 'with_v2', prompt: "I am considering withdrawing from this class.", choiceType: "boolean" },
+  { code: 'supp', prompt: "I feel like I need extra help in this class.", choiceType: "boolean" },
+  { code: 'con1', prompt: "I am confident in my ability to complete the work in this class.", choiceType: "scale" },  
+  { code: 'con2', prompt: "I am certain I can learn the content taught in this class.", choiceType: "scale" },
+  { code: 'con3', prompt: "I am good at learning the content covered in this class.", choiceType: "scale" },
+  { code: 'sth1', prompt: "I manage my time effectively for this course.", choiceType: "scale" },
+  { code: 'sth2', prompt: "I keep up with the readings and assignments for this course.", choiceType: "scale" },
+  { code: 'sth3', prompt: "I balance the work in this class with my other commitments.", choiceType: "scale" },
+  { code: 'abur1', prompt: "Sometimes I wish I could “run away” from this class.", choiceType: "scale" },
+  { code: 'abur2', prompt: "I am worried about my future because of how I am performing in this class.", choiceType: "scale" },
+  { code: 'abur3', prompt: "My relationships with family, relatives, and friends are suffering because this class is a challenge.", choiceType: "scale" },
+  { code: 'mot1', prompt: "I do my work in this class because I enjoy it.", choiceType: "scale" },
+  { code: 'mot2', prompt: "I do my work in this class because I want to learn new things.", choiceType: "scale" },
+  { code: 'mot3', prompt: "In this class, I have been doing what really interests me.", choiceType: "scale" },
+  { code: 'res1', prompt: "I have a hard time making it through stressful things in this class.", choiceType: "scale" },
+  { code: 'res2', prompt: "It is difficult for me to recover when I get overwhelmed in this class.", choiceType: "scale" },
+  { code: 'res3', prompt: "It takes me a long time to get over set-backs in this class.", choiceType: "scale" }
+];
+
+function constructCodeForQuestionCode(qCode) {
+  // exact matches
+  if (["employ","numcourse","fin","with_v2","supp"].includes(qCode)) return qCode;
+
+  // prefix groups
+  if (qCode.startsWith("comit")) return "comit";
+  if (qCode.startsWith("con")) return "con";
+  if (qCode.startsWith("sth")) return "sth";
+  if (qCode.startsWith("abur")) return "abur";
+  if (qCode.startsWith("mot")) return "mot";
+  if (qCode.startsWith("res")) return "res";
+
+  return null;
+}
+
+const TERM_YEAR = 2026;
+const TERM_SEMESTER = 'SP';
+
 const PT_ZONE = 'America/Los_Angeles';
 
 function resolveWindow(sinceISO, untilISO, now = DateTime.now().setZone(PT_ZONE)) {
-  const today4 = now.startOf('day').plus({ hours: 4 });
-  const anchor = (now < today4) ? today4.minus({ days: 1 }) : today4;
+  const today2 = now.startOf('day').plus({ hours: 2 });
+  const anchor = (now < today2) ? today2.minus({ days: 1 }) : today2;
   const defSince = anchor.minus({ days: 1 });
   const defUntil = anchor;
 
@@ -31,19 +74,48 @@ function resolveWindow(sinceISO, untilISO, now = DateTime.now().setZone(PT_ZONE)
   };
 }
 
-// Keep your question list as-is
-const QUESTION_LIST = [ /* … your QUESTION_LIST unchanged … */ ];
+const extractCodesFromQuestionText = (questionText) => {
+  // const matches = questionText.match(/\[([a-z]+\d+)\]/gi); // e.g., [se1]
+  // return matches ? matches.map((m) => m.replace(/\[|\]/g, '')) : [];
+
+  // updated on 011226 to handle code: employ, with_v2, etc.
+  const matches = questionText.match(/\[([a-z_]+(?:\d+)?)\]/gi);
+  return matches ? matches.map(m => m.slice(1, -1)) : [];
+
+};
 
 async function seedQuestionsOnce() {
   const client = await db.quizDb.connect();
   try {
     await client.query('BEGIN');
     for (const { code, prompt } of QUESTION_LIST) {
+
+      const cCode = constructCodeForQuestionCode(code);
+      if (!cCode) throw new Error(`No construct match for question code ${code}`);
+      const { rows: cRows } = await client.query(
+        `
+        SELECT id
+        FROM constructs
+        WHERE code = $1
+          AND year = $2
+          AND semester = $3
+          AND status = 'active'
+        `,
+        [cCode, TERM_YEAR, TERM_SEMESTER]
+      );
+      if (cRows.length === 0){
+        throw new Error(`Construct not found for code ${cCode} (${TERM_SEMESTER}${TERM_YEAR})`);
+      }
+      const constructId = cRows[0].id;
+
       await client.query(
-        `INSERT INTO questions (code, prompt)
-         VALUES ($1, $2)
-         ON CONFLICT (code) DO UPDATE SET prompt = EXCLUDED.prompt`,
-        [code, prompt]
+        `INSERT INTO questions (code, prompt, construct_id)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (code) DO UPDATE 
+         SET prompt = EXCLUDED.prompt,
+             construct_id = EXCLUDED.construct_id
+         `,
+        [code, prompt, constructId]
       );
     }
     const { rows } = await client.query('SELECT id, code FROM questions');
@@ -54,6 +126,25 @@ async function seedQuestionsOnce() {
     throw e;
   } finally {
     client.release();
+  }
+}
+
+/** Build a userId -> current_score map from enrollments */
+async function buildScoreMap(courseId) {
+  try {
+    const enrollments = await getAllPages(
+      `https://unlv.instructure.com/api/v1/courses/${courseId}/enrollments?type[]=StudentEnrollment`
+    );
+    const scoreMap = {};
+    for (const enr of enrollments) {
+      const uid = enr.user_id;
+      const cs = enr.grades?.current_score;
+      if (uid && typeof cs === 'number') scoreMap[uid] = cs;
+    }
+    return scoreMap;
+  } catch (err) {
+    console.error(`Failed to retrieve enrollments for course ${courseId}:`, err);
+    return {};
   }
 }
 
@@ -178,11 +269,15 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     const courseDetails = await canvasRequest(`courses/${courseId}`);
     const courseName = courseDetails?.data?.name || `Course ${courseId}`;
     const courseUpsert = await client.query(
-      `INSERT INTO courses (canvas_course_id, name, is_demo)
-       VALUES ($1, $2, false)
-       ON CONFLICT (canvas_course_id) DO UPDATE SET name = EXCLUDED.name
+      `INSERT INTO courses (canvas_course_id, name, is_demo, year, semester, status)
+       VALUES ($1, $2, false, $3, $4, $5)
+       ON CONFLICT (canvas_course_id) DO UPDATE 
+       SET name = EXCLUDED.name,
+           year = EXCLUDED.year,
+           semester = EXCLUDED.semester,
+           status = EXCLUDED.status
        RETURNING id`,
-      [courseId, courseName]
+      [courseId, courseName, TERM_YEAR, TERM_SEMESTER, 'active']
     );
     const dbCourseId = courseUpsert.rows[0].id;
 
@@ -224,7 +319,7 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
       studentIdByUserId[uid] = dbStudentId;
     }
 
-    await seedExternalScoresForRoster(client, enrollments, studentIdByUserId);
+    // await seedExternalScoresForRoster(client, enrollments, studentIdByUserId);
 
     // 4) Quizzes
     const quizzes = await getQuizzesByCourseId(courseId);
