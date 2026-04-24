@@ -1,12 +1,23 @@
 // seedQuiz.js
 const db = require('./db'); // keep RDS here; use ./dbTimescale only for click
 const { DateTime } = require('luxon');
+const { sendAlertEmail } = require("./notify"); 
 const {
   canvasRequest,
   getAllPages,
   getQuizzesByCourseId,
   extractQuizScoresByUser,
 } = require('./utils');
+
+const PT_ZONE = 'America/Los_Angeles';
+
+function toPT(iso) {
+  if (!iso) return 'n/a';
+  const dt = DateTime.fromISO(iso, { zone: 'utc' });
+  return dt.isValid
+    ? dt.setZone(PT_ZONE).toFormat('yyyy-LL-dd HH:mm ZZZZ')
+    : 'invalid';
+}
 
 const QUESTION_LIST = [ // streamlined for SP26
   { code: 'employ', prompt: "What is your employment status?", choiceType: "employment" },
@@ -37,7 +48,7 @@ function constructCodeForQuestionCode(qCode) {
   // exact matches
   if (["employ","numcourse","fin","with_v2","supp"].includes(qCode)) return qCode;
 
-  // prefix groups
+  // prefix groups   
   if (qCode.startsWith("comit")) return "comit";
   if (qCode.startsWith("con")) return "con";
   if (qCode.startsWith("sth")) return "sth";
@@ -50,8 +61,6 @@ function constructCodeForQuestionCode(qCode) {
 
 const TERM_YEAR = 2026;
 const TERM_SEMESTER = 'SP';
-
-const PT_ZONE = 'America/Los_Angeles';
 
 function resolveWindow(sinceISO, untilISO, now = DateTime.now().setZone(PT_ZONE)) {
   const today2 = now.startOf('day').plus({ hours: 2 });
@@ -249,6 +258,36 @@ async function seedExternalScoresForRoster(client, enrollments, studentIdByUserI
   }
 }
 
+async function seedMissingAssignments(client, courseId, studentIdByUserId) {
+  let summaries = [];
+  try {
+    summaries = await getAllPages(
+      `https://unlv.instructure.com/api/v1/courses/${courseId}/analytics/student_summaries`
+    );
+  } catch (err) {
+    console.error(`Failed to retrieve student summaries for course ${courseId}:`, err);
+    return
+  }
+
+  for (const summary of summaries) {
+    const canvasUserId = summary.id;
+    const missing = summary.tardiness_breakdown?.missing ?? 0; 
+
+    const dbStudentId = studentIdByUserId[canvasUserId];
+    if (!dbStudentId){
+      console.warn(`Skipping missing student for user ${canvasUserId}; not in current course roster`);
+      continue;
+    }
+    
+    await client.query(
+      `UPDATE students SET missing_assignments = $1 WHERE id = $2`,
+      [missing, dbStudentId]
+    );
+  }
+s
+  console.log(`Updated missing assignments for ${summaries.length} students`);
+}
+
       
 
 /** Seed ONE course in a time window: mirrors seedClick signature */
@@ -320,10 +359,23 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     }
 
     // await seedExternalScoresForRoster(client, enrollments, studentIdByUserId);
+    await seedMissingAssignments(client, courseId, studentIdByUserId)
 
     // 4) Quizzes
+    const unpublished = [];
     const quizzes = await getQuizzesByCourseId(courseId);
     for (const quiz of quizzes) {
+      if (quiz.published === false) {
+        unpublished.push({
+          courseId,
+          quizId: quiz.id,
+          title: quiz.title,
+          unlock_at: toPT(quiz.unlock_at),
+          lock_at: toPT(quiz.lock_at),
+          due_at: toPT(quiz.due_at),
+        });
+      }
+      
       const quizUpsert = await client.query(
         `INSERT INTO quizzes (canvas_quiz_id, assignment_id, course_id, title, due_at)
          VALUES ($1, $2, $3, $4, $5)
@@ -335,8 +387,14 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
         [quiz.id, quiz.assignment_id, dbCourseId, quiz.title, quiz.due_at]
       );
       const dbQuizId = quizUpsert.rows[0].id;
-      console.log('Quiz:', quiz.id, quiz.assignment_id, quiz.title);
-
+      console.log(
+        'Quiz:',
+        quiz.title,
+        'published=', quiz.published,
+        'due=', toPT(quiz.due_at),
+        'unlock=', toPT(quiz.unlock_at),
+        'lock=', toPT(quiz.lock_at)
+      );
       // Fetch quiz questions for answer-id→text mapping
       const questionRes = await canvasRequest(`courses/${courseId}/quizzes/${quiz.id}/questions`);
       const allQuestions = questionRes?.data || [];
@@ -461,6 +519,23 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
         }
       }
     }
+
+    if (unpublished.length) {
+      const lines = unpublished.map(x =>
+        `- ${x.courseId},${x.title},unlock=${x.unlock_at},lock=${x.lock_at},due=${x.due_at}`
+      ).join("\n");
+
+      await sendAlertEmail({
+        subject: `[iTOOLS] Unpublished quizzes detected (course ${courseId})`,
+        text:
+        `Found ${unpublished.length} unpublished quiz(es) while seeding.
+        Course: ${courseId}
+        ${lines}
+        `
+      })
+    }
+
+    
 
     await client.query('COMMIT');
   } catch (err) {
