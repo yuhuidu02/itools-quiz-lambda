@@ -59,8 +59,8 @@ function constructCodeForQuestionCode(qCode) {
   return null;
 }
 
-const TERM_YEAR = 2026;
-const TERM_SEMESTER = 'SP';
+// const TERM_YEAR = 2026;
+// const TERM_SEMESTER = 'SP';
 
 function resolveWindow(sinceISO, untilISO, now = DateTime.now().setZone(PT_ZONE)) {
   const today2 = now.startOf('day').plus({ hours: 2 });
@@ -93,7 +93,7 @@ const extractCodesFromQuestionText = (questionText) => {
 
 };
 
-async function seedQuestionsOnce() {
+async function seedQuestionsOnce(termYear, termSemester) {
   const client = await db.quizDb.connect();
   try {
     await client.query('BEGIN');
@@ -110,10 +110,10 @@ async function seedQuestionsOnce() {
           AND semester = $3
           AND status = 'active'
         `,
-        [cCode, TERM_YEAR, TERM_SEMESTER]
+        [cCode, termYear, termSemester]
       );
       if (cRows.length === 0){
-        throw new Error(`Construct not found for code ${cCode} (${TERM_SEMESTER}${TERM_YEAR})`);
+        throw new Error(`Construct not found for code ${cCode} (${termSemester}${termYear})`);
       }
       const constructId = cRows[0].id;
 
@@ -142,7 +142,7 @@ async function seedQuestionsOnce() {
 async function buildScoreMap(courseId) {
   try {
     const enrollments = await getAllPages(
-      `https://unlv.instructure.com/api/v1/courses/${courseId}/enrollments?type[]=StudentEnrollment`
+      `https://unlv.test.instructure.com/api/v1/courses/${courseId}/enrollments?type[]=StudentEnrollment`
     );
     const scoreMap = {};
     for (const enr of enrollments) {
@@ -161,33 +161,55 @@ async function buildScoreMap(courseId) {
 async function getCourseEnrollments(courseId) {
   // include[]=user for names; enumerate states so inactive/completed show up
   const url =
-    `https://unlv.instructure.com/api/v1/courses/${courseId}/enrollments` +
+    `https://unlv.test.instructure.com/api/v1/courses/${courseId}/enrollments` +
     `?type[]=StudentEnrollment&state[]=active&state[]=inactive&state[]=completed&state[]=invited&include[]=user`;
   return getAllPages(url);
 }
 
 /** Upsert a student and link to course; return db student id */
-async function ensureStudent(client, { userId, name, currentScore, dbCourseId, status = 'active' }) {
+async function ensureStudent(client, { userId, name, dbCourseId, status = 'active', sectionNumber }) {
   const upsert = await client.query(
-    `INSERT INTO students (canvas_user_id, name, current_score)
-     VALUES ($1, $2, $3)
+    `INSERT INTO students (canvas_user_id, name)
+     VALUES ($1, $2)
      ON CONFLICT (canvas_user_id) DO UPDATE
-       SET name = EXCLUDED.name,
-           current_score = EXCLUDED.current_score
+       SET name = EXCLUDED.name
      RETURNING id`,
-    [userId, name || '', (typeof currentScore === 'number' ? currentScore : null)]
+    [userId, name || '']
   );
   const dbStudentId = upsert.rows[0].id;
 
   await client.query(
-    `INSERT INTO student_courses (student_id, course_id, status)
-     VALUES ($1, $2, $3)
+    `INSERT INTO student_courses (student_id, course_id, status, section_number)
+     VALUES ($1, $2, $3, $4)
      ON CONFLICT (student_id, course_id) DO UPDATE
-       SET status = EXCLUDED.status`,
-    [dbStudentId, dbCourseId, status || 'active']
+       SET status = EXCLUDED.status,
+           section_number = EXCLUDED.section_number`,
+    [dbStudentId, dbCourseId, status || 'active', sectionNumber || null]
   );
 
   return dbStudentId;
+}
+
+/* section number */
+async function buildSectionMap(courseId) {
+  let sections = [];
+  try {
+    sections = await getAllPages(
+      `https://unlv.test.instructure.com/api/v1/courses/${courseId}/sections?include[]=students`
+    );
+  } catch (err) {
+    console.error(`Failed to retrieve sections for course ${courseId}:`, err);
+    return {};
+  }
+
+  const userToSection = {};
+  for (const section of sections) {
+    const sectionNumber = section.sis_section_id?.match(/SEC(\d+)/)?.[1] || null;
+    for (const student of (section.students || [])) {
+      userToSection[student.id] = sectionNumber;
+    }
+  }
+  return userToSection; // { canvas_user_id: 1001, ... }
 }
 
 /** Upsert previous unposted final scores into external_course_scores */
@@ -258,11 +280,11 @@ async function seedExternalScoresForRoster(client, enrollments, studentIdByUserI
   }
 }
 
-async function seedMissingAssignments(client, courseId, studentIdByUserId) {
+async function seedMissingAssignments(client, courseId, dbCourseId, studentIdByUserId) {
   let summaries = [];
   try {
     summaries = await getAllPages(
-      `https://unlv.instructure.com/api/v1/courses/${courseId}/analytics/student_summaries`
+      `https://unlv.test.instructure.com/api/v1/courses/${courseId}/analytics/student_summaries`
     );
   } catch (err) {
     console.error(`Failed to retrieve student summaries for course ${courseId}:`, err);
@@ -280,18 +302,55 @@ async function seedMissingAssignments(client, courseId, studentIdByUserId) {
     }
     
     await client.query(
-      `UPDATE students SET missing_assignments = $1 WHERE id = $2`,
-      [missing, dbStudentId]
+      `INSERT INTO student_score_snapshots (student_id, course_id, missing_assignments, recorded_at)
+       VALUES ($1, $2, $3, NOW())`,
+      [dbStudentId, dbCourseId, missing]
     );
   }
 s
   console.log(`Updated missing assignments for ${summaries.length} students`);
 }
 
-      
+async function seedLabScores(client, lectureDbCourseId) {
+  // find lab course linked to this lecture course
+  const { rows } = await client.query(
+    `SELECT id, canvas_course_id FROM courses
+     WHERE parent_course_id = $1 AND course_type = 'lab'`,
+    [lectureDbCourseId]
+  );
+
+  if (!rows.length) return; // no linked lab course found, skip
+
+  for (const lab of rows) {
+    const labEnrollments = await getCourseEnrollments(lab.canvas_course_id);
+    for (const enr of labEnrollments) {
+      const uid = enr.user_id;
+      const currentScore = (enr.grades && typeof enr.grades.current_score === 'number')
+        ? enr.grades.current_score: null;
+      if (!uid || typeof currentScore !== 'number') continue;
+
+      // find matching student in lecture course by canvas_user_id
+      const { rows: sRows } = await client.query(
+        `SELECT id FROM students WHERE canvas_user_id = $1`,[uid]
+      );
+      if (!sRows.length) {
+        console.warn(`No student found in lecture course for user ${uid} (lab score ${currentScore} not linked)`);
+        continue;
+      }
+
+      // insert lab score as a separate snapshot (could be enhanced to link to specific quiz/assignment)
+      await client.query(
+        `INSERT INTO student_score_snapshots (student_id, course_id, current_score, recorded_at)
+         VALUES ($1, $2, $3, NOW())`,
+        [sRows[0].id, lab.id, currentScore]
+      );
+    }
+  }
+}
+
 
 /** Seed ONE course in a time window: mirrors seedClick signature */
-async function seedQuiz(courseId, sinceISO, untilISO) {
+async function seedQuiz(courseId, sinceISO, untilISO, termYear = 2026, termSemester = 'SP') {
   const { sinceISO: sISO, untilISO: uISO, sinceLocal, untilLocal } = resolveWindow(sinceISO, untilISO);
 
   // 1) ensure questions exist and get code->id map
@@ -316,12 +375,14 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
            semester = EXCLUDED.semester,
            status = EXCLUDED.status
        RETURNING id`,
-      [courseId, courseName, TERM_YEAR, TERM_SEMESTER, 'active']
-    );
+      [courseId, courseName, termYear, termSemester, 'active']
+    ); // no-op if already exists; otherwise update name/year/semester/status
     const dbCourseId = courseUpsert.rows[0].id;
 
     // 3) Roster from ENROLLMENTS ONLY (authoritative for status + grade + user)
     const enrollments = await getCourseEnrollments(courseId);
+
+    const sectionMap = await buildSectionMap(courseId);
 
     // Optional: quick visibility into counts by status
     const statusCounts = enrollments.reduce((acc, e) => {
@@ -332,7 +393,6 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     console.log('Enrollment status counts:', statusCounts);
 
     // Ensure roster based on enrollments
-    const scoreMap = {}; // not strictly needed, but kept if you later reuse
     const studentIdByUserId = {}; // map Canvas user_id → RDS student.id
 
     for (const enr of enrollments) {
@@ -345,21 +405,30 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
 
       if (!uid) continue;
 
-      if (typeof currentScore === 'number') scoreMap[uid] = currentScore;
+      if (typeof currentScore === 'number') {
+        await client.query(
+          `INSERT INTO student_score_snapshots (student_id, course_id, current_score, recorded_at)
+           VALUES ($1, $2, $3, NOW())`,
+           [dbStudentId, dbCourseId, currentScore]
+        );  
+      } 
+      const sectionNumber = sectionMap[uid] || null;
 
       const dbStudentId = await ensureStudent(client, {
         userId: uid,
         name,
-        currentScore,
         dbCourseId,
         status,
+        sectionNumber,
       });
 
       studentIdByUserId[uid] = dbStudentId;
     }
 
     // await seedExternalScoresForRoster(client, enrollments, studentIdByUserId);
-    await seedMissingAssignments(client, courseId, studentIdByUserId)
+    await seedMissingAssignments(client, courseId, dbCourseId, studentIdByUserId)
+
+    await seedLabScores(client, dbCourseId);
 
     // 4) Quizzes
     const unpublished = [];
@@ -403,7 +472,7 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
       let submissions = [];
       try {
         submissions = await getAllPages(
-          `https://unlv.instructure.com/api/v1/courses/${courseId}/assignments/${quiz.assignment_id}/submissions?include[]=submission_history`
+          `https://unlv.test.instructure.com/api/v1/courses/${courseId}/assignments/${quiz.assignment_id}/submissions?include[]=submission_history`
         );
       } catch (err) {
         console.error(`Failed to retrieve submissions for quiz assignment ${quiz.assignment_id}:`, err);

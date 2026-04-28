@@ -6,13 +6,13 @@ const client = new LambdaClient({ region: "us-west-2" });
 const FUNCTION_NAME = process.env.AWS_LAMBDA_FUNCTION_NAME;
 
 exports.handler = async (event = {}) => {
-  const { courses, courseId, sinceISO, untilISO, worker } = event;
+  const { courses, courseId, sinceISO, untilISO, worker, termYear, termSemester } = event;
 
   // Worker
   if (worker || (courseId && !Array.isArray(courses))) {
     if (!courseId) return { statusCode: 400, body: "courseId required" };
     console.log("Worker starting for course:", courseId, { sinceISO, untilISO });
-    await seedQuiz(courseId, sinceISO, untilISO);   // ⬅️ change here
+    await seedQuiz(courseId, sinceISO, untilISO, termYear, termSemester);   // ⬅️ change here
     return { statusCode: 200, body: `Completed course ${courseId}` };
   }
 
@@ -33,7 +33,9 @@ exports.handler = async (event = {}) => {
           worker: true,
           courseId: c,
           sinceISO,
-          untilISO
+          untilISO,
+          termYear,
+          termSemester
         }))
       }));
     }
