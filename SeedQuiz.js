@@ -167,14 +167,15 @@ async function getCourseEnrollments(courseId) {
 }
 
 /** Upsert a student and link to course; return db student id */
-async function ensureStudent(client, { userId, name, dbCourseId, status = 'active', sectionNumber }) {
+async function ensureStudent(client, { userId, name, currentScore, dbCourseId, status = 'active', sectionNumber }) {
   const upsert = await client.query(
-    `INSERT INTO students (canvas_user_id, name)
-     VALUES ($1, $2)
+    `INSERT INTO students (canvas_user_id, name, current_score)
+     VALUES ($1, $2, $3)
      ON CONFLICT (canvas_user_id) DO UPDATE
-       SET name = EXCLUDED.name
+       SET name = EXCLUDED.name,
+           current_score = EXCLUDED.current_score
      RETURNING id`,
-    [userId, name || '']
+     [userId, name || '', (typeof currentScore === 'number' ? currentScore : null)]
   );
   const dbStudentId = upsert.rows[0].id;
 
@@ -307,7 +308,7 @@ async function seedMissingAssignments(client, courseId, dbCourseId, studentIdByU
       [dbStudentId, dbCourseId, missing]
     );
   }
-s
+
   console.log(`Updated missing assignments for ${summaries.length} students`);
 }
 
@@ -354,7 +355,7 @@ async function seedQuiz(courseId, sinceISO, untilISO, termYear = 2026, termSemes
   const { sinceISO: sISO, untilISO: uISO, sinceLocal, untilLocal } = resolveWindow(sinceISO, untilISO);
 
   // 1) ensure questions exist and get code->id map
-  const codeToQuestionId = await seedQuestionsOnce();
+  const codeToQuestionId = await seedQuestionsOnce(termYear, termSemester);
 
   const client = await db.quizDb.connect();
   try {
@@ -405,6 +406,18 @@ async function seedQuiz(courseId, sinceISO, untilISO, termYear = 2026, termSemes
 
       if (!uid) continue;
 
+      
+      const sectionNumber = sectionMap[uid] || null;
+
+      const dbStudentId = await ensureStudent(client, {
+        userId: uid,
+        name,
+        currentScore,
+        dbCourseId,
+        status,
+        sectionNumber,
+      });
+
       if (typeof currentScore === 'number') {
         await client.query(
           `INSERT INTO student_score_snapshots (student_id, course_id, current_score, recorded_at)
@@ -412,15 +425,6 @@ async function seedQuiz(courseId, sinceISO, untilISO, termYear = 2026, termSemes
            [dbStudentId, dbCourseId, currentScore]
         );  
       } 
-      const sectionNumber = sectionMap[uid] || null;
-
-      const dbStudentId = await ensureStudent(client, {
-        userId: uid,
-        name,
-        dbCourseId,
-        status,
-        sectionNumber,
-      });
 
       studentIdByUserId[uid] = dbStudentId;
     }
