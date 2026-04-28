@@ -307,6 +307,10 @@ async function seedMissingAssignments(client, courseId, dbCourseId, studentIdByU
        VALUES ($1, $2, $3, NOW())`,
       [dbStudentId, dbCourseId, missing]
     );
+    await client.query(
+      `UPDATE students SET missing_assignments = $1 WHERE id = $2`,
+      [missing, dbStudentId]
+    );
   }
 
   console.log(`Updated missing assignments for ${summaries.length} students`);
