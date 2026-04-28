@@ -364,21 +364,30 @@ async function seedQuiz(courseId, sinceISO, untilISO, termYear = 2026, termSemes
     console.log(`Time window PT:   [${sinceLocal} -> ${untilLocal}]`);
     console.log(`Time window ISO:  [${sISO} -> ${uISO}]`);
 
-    // 2) Upsert course
-    const courseDetails = await canvasRequest(`courses/${courseId}`);
-    const courseName = courseDetails?.data?.name || `Course ${courseId}`;
-    const courseUpsert = await client.query(
-      `INSERT INTO courses (canvas_course_id, name, is_demo, year, semester, status)
-       VALUES ($1, $2, false, $3, $4, $5)
-       ON CONFLICT (canvas_course_id) DO UPDATE 
-       SET name = EXCLUDED.name,
-           year = EXCLUDED.year,
-           semester = EXCLUDED.semester,
-           status = EXCLUDED.status
-       RETURNING id`,
-      [courseId, courseName, termYear, termSemester, 'active']
-    ); // no-op if already exists; otherwise update name/year/semester/status
-    const dbCourseId = courseUpsert.rows[0].id;
+    // // 2) Upsert course
+    // const courseDetails = await canvasRequest(`courses/${courseId}`);
+    // const courseName = courseDetails?.data?.name || `Course ${courseId}`;
+    // const courseUpsert = await client.query(
+    //   `INSERT INTO courses (canvas_course_id, name, is_demo, year, semester, status)
+    //    VALUES ($1, $2, false, $3, $4, $5)
+    //    ON CONFLICT (canvas_course_id) DO UPDATE 
+    //    SET name = EXCLUDED.name,
+    //        year = EXCLUDED.year,
+    //        semester = EXCLUDED.semester,
+    //        status = EXCLUDED.status
+    //    RETURNING id`,
+    //   [courseId, courseName, termYear, termSemester, 'active']
+    // ); // no-op if already exists; otherwise update name/year/semester/status
+    // const dbCourseId = courseUpsert.rows[0].id;
+    // 2) Get course from DB (must be pre-inserted)
+    const { rows: courseRows } = await client.query(
+      `SELECT id FROM courses WHERE canvas_course_id = $1`,
+      [courseId]
+    );
+    if (!courseRows.length) {
+      throw new Error(`Course ${courseId} not found in DB — please insert it manually first`);
+    }
+    const dbCourseId = courseRows[0].id;
 
     // 3) Roster from ENROLLMENTS ONLY (authoritative for status + grade + user)
     const enrollments = await getCourseEnrollments(courseId);
