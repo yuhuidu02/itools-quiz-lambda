@@ -60,7 +60,7 @@ function constructCodeForQuestionCode(qCode) {
 }
 
 const TERM_YEAR = 2026;
-const TERM_SEMESTER = 'SP';
+const TERM_SEMESTER = 'SU';
 
 function resolveWindow(sinceISO, untilISO, now = DateTime.now().setZone(PT_ZONE)) {
   const today2 = now.startOf('day').plus({ hours: 2 });
