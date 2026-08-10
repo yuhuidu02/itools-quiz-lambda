@@ -81,6 +81,12 @@ function resolveWindow(sinceISO, untilISO, now = DateTime.now().setZone(PT_ZONE)
   };
 }
 
+const MISSING_ASSIGNMENT_EXCLUDE = /\b(reflection|syllabus|not counted|final grades|extra credit|survey)\b/i;
+
+function countsTowardMissing(assignment) {
+  return assignment.points_possible > 0 && !MISSING_ASSIGNMENT_EXCLUDE.test(assignment.name);
+}
+
 async function seedQuestionsOnce() {
   const client = await db.quizDb.connect();
   try {
@@ -299,18 +305,31 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     // 3c) Fetch missing assignment counts once for all students
     let missingByUserId = {};
     try {
-      const summaries = await getAllPages(
-        `${CANVAS_API_BASE}/api/v1/courses/${courseId}/analytics/student_summaries`
-      );
-      for (const s of summaries) {
-        missingByUserId[s.id] = s.tardiness_breakdown?.missing ?? 0;
-      }
-      console.log(`Fetched missing assignment counts for ${summaries.length} students`);
-    } catch (err) {
-      console.error(`Failed to retrieve student summaries for course ${courseId}:`, err.message);
-      // non-fatal: missing_assignments will be null for this course
-    }
 
+      const countedAssignmentIds = allAssignments
+        .filter(countsTowardMissing)
+        .map(a => a.id);
+
+      if (countedAssignmentIds.length) {
+        const idParams = countedAssignmentIds.map(id => `assignment_ids[]=${id}`).join('&');
+        const submissions = await getAllPages(
+          `${CANVAS_API_BASE}/api/v1/courses/${courseId}/students/submissions` +
+          `?student_ids[]=all&${idParams}&per_page=100`
+        );
+        
+        for (const sub of submissions) {
+          if (sub.missing) {
+            missingByUserId[sub.user_id] = (missingByUserId[sub.user_id] || 0) + 1;
+          } else {
+            missingByUserId[sub.user_id] = missingByUserId[sub.user_id] || 0;
+          }
+        }
+      }
+      console.log(`Computed missing assignment counts for ${Object.keys(missingByUserId).length} students`);
+    } catch (err) {
+      console.error(`Failed to compute missing assignments for course ${courseId}:`, err.message);
+    }
+    
     // 4) Process each enrolled student
     const studentIdByUserId = {};
 
