@@ -1,5 +1,6 @@
 const https = require('https');
 const axiosBase = require('axios');
+const { parse } = require('path');
 const axios = axiosBase;
 
 const scaleMap = {
@@ -63,6 +64,14 @@ const CODE_TYPE_MAP = {
 
 const CANVAS_API_BASE = process.env.LTI_PLATFORM_URL
 const CANVAS_TOKEN = process.env.CANVAS_TOKEN
+
+const QUIZ_EXAM_INCLUDE = /\b(exam|quiz|quizes|test|midterm|final)\b/i;
+const QUIZ_EXAM_EXCLUDE = /\b(reflection|syllabus|not counted|final grades)\b/i;
+ 
+function isQuizExamGroup(name) {
+    const n = name.trim();
+    return QUIZ_EXAM_INCLUDE.test(n) && !QUIZ_EXAM_EXCLUDE.test(n);
+}
 
 const http = axiosBase.create({
     baseURL: `${CANVAS_API_BASE}/api/v1/`,
@@ -183,7 +192,7 @@ async function getAllPages(url, config = {}) {
 
 async function getQuizzesByCourseId(courseId) {
     let allQuizzes = [];
-    let url = `courses/${courseId}/quizzes`
+    let url = `courses/${courseId}/quizzes?per_page=100`; // Fetch quizzes with a page size of 100 to speed up the sequence
 
     while (url) {
         const response = await canvasRequest(url);
@@ -192,7 +201,7 @@ async function getQuizzesByCourseId(courseId) {
         // Parse pagination links from response headers
         const linkHeader = response.headers.link;
         const nextLinkMatch = linkHeader && linkHeader.match(/<([^>]+)>;\s*rel="next"/);
-        url = nextLinkMatch ? nextLinkMatch[1].replace('https://unlv.test.instructure.com/api/v1/', '') : null;
+        url = nextLinkMatch ? nextLinkMatch[1].replace('{CANVAS_API_BASE}/api/v1/', '') : null;
     }
 
     const dailyReflections = allQuizzes.filter(quiz =>
@@ -213,7 +222,7 @@ async function getUsersByCourseId(courseId) { // get active students only - so c
         // Parse pagination links from response headers
         const linkHeader = response.headers.link;
         const nextLinkMatch = linkHeader && linkHeader.match(/<([^>]+)>;\s*rel="next"/);
-        url = nextLinkMatch ? nextLinkMatch[1].replace('https://unlv.test.instructure.com/api/v1/', '') : null;
+        url = nextLinkMatch ? nextLinkMatch[1].replace('{CANVAS_API_BASE}/api/v1/', '') : null;
 
     }
 
@@ -256,18 +265,71 @@ function extractQuizScoresByUser(submissions) {
     return result;
 }
 
-async function getAnalyticsAssignmentsByUser(courseId, userId) {
-    return getAllPages(`courses/${courseId}/analytics/users/${userId}/assignments`)
+/**
+ * Parse a Canvas enrollment term name into { year, semester }.
+ *
+ * Handles the term-name shapes Canvas/SIS commonly produce:
+ *   "Spring 2026", "2026 Spring", "SP 2026", "2026 SP",
+ *   "SP26", "2026SP", "26-SP", "Fall 2025", "FA25",
+ *   "Summer 2026", "SU26", "2026 Sprg", "2026 Sumr", "Summer III 2026"
+ *
+ * semester is one of 'SP' | 'FA' | 'SU'. Either field can come back null
+ * if it can't be confidently determined — callers should fall back to a
+ * known-good default rather than write a guess, and a warning is logged
+ * so unrecognized term-name formats are visible in the logs instead of
+ * silently mis-tagging a course.
+ */
+function parseTermName(termName) {
+    if (!termName || typeof termName !== 'string') {
+        return { year: null, semester: null };
+    }
+ 
+    const text = termName.trim();
+    const lower = text.toLowerCase();
+ 
+    // --- Year: prefer a clean 4-digit year; fall back to a 2-digit year
+    // glued to a season code (e.g. "SP26", "26-SP"). ---
+    let year = null;
+    const y4 = text.match(/(?<!\d)(20\d{2})/);
+    if (y4) {
+        year = parseInt(y4[1], 10);
+    } else {
+        const y2 = lower.match(/(?:sp|fa|su)\s*-?\s*(\d{2})\b/) || lower.match(/\b(\d{2})\s*-?\s*(?:sp|fa|su)\b/);
+        if (y2) year = 2000 + parseInt(y2[1], 10);
+    }
+ 
+    // --- Semester: check full words/abbreviations first (unambiguous), then
+    // fall back to bare 2-letter codes only when NOT adjacent to other letters
+    // (so "SP26" matches but "Special" or "Fall" itself doesn't double-match
+    // through the short-code path). ---
+    let semester = null;
+    if (/spring|sprg/.test(lower)) {
+        semester = 'SP';
+    } else if (/fall|autumn/.test(lower)) {
+        semester = 'FA';
+    } else if (/summer|sumr/.test(lower)) {
+        semester = 'SU';
+    } else if (/(?<![a-z])sp(?![a-z])/i.test(text)) {
+        semester = 'SP';
+    } else if (/(?<![a-z])fa(?![a-z])/i.test(text)) {
+        semester = 'FA';
+    } else if (/(?<![a-z])su(?![a-z])/i.test(text)) {
+        semester = 'SU';
+    }
+ 
+    if (!year || !semester) {
+        console.warn(`[parseTermName] Could not fully parse term name "${termName}" -> year=${year}, semester=${semester}`);
+    }
+ 
+    return { year, semester };
 }
-
-async function getMissingAssignmentsCount(courseId, userId) {
     
-}
-
 module.exports = {
+    isQuizExamGroup,
     canvasRequest,
     getAllPages,
     getQuizzesByCourseId,
     getUsersByCourseId,
     extractQuizScoresByUser,
+    parseTermName,
 };
