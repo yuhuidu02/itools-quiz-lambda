@@ -160,7 +160,7 @@ async function ensureStudent(client, { userId, name, dbCourseId, status = 'activ
   return dbStudentId;
 }
 
-function chunkArray(arr, size) { // new function
+function chunkArray(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
   return out;
@@ -175,7 +175,7 @@ function chunkArray(arr, size) { // new function
  */
 async function ensureStudentsBulk(client, students, dbCourseId, chunkSize = 500) {
   const studentIdByUserId = {};
- 
+
   for (const chunk of chunkArray(students, chunkSize)) {
     const sParams = [];
     const sValues = [];
@@ -194,7 +194,7 @@ async function ensureStudentsBulk(client, students, dbCourseId, chunkSize = 500)
       sParams
     );
     for (const row of studentRows) studentIdByUserId[row.canvas_user_id] = row.id;
- 
+
     const scParams = [];
     const scValues = [];
     p = 1;
@@ -212,7 +212,7 @@ async function ensureStudentsBulk(client, students, dbCourseId, chunkSize = 500)
       scParams
     );
   }
- 
+
   return studentIdByUserId;
 }
 
@@ -355,10 +355,21 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     console.log(`Time window PT:   [${sinceLocal} -> ${untilLocal}]`);
     console.log(`Time window ISO:  [${sISO} -> ${uISO}]`);
 
+    // Step-timing: logs how long each major step took, so a CloudWatch log
+    // shows exactly which step a run is in (or stuck in) instead of just a
+    // silent gap followed by a timeout kill.
+    let __stepStart = Date.now();
+    const step = (label) => {
+      const now = Date.now();
+      console.log(`[step] ${label}: ${now - __stepStart}ms (course ${courseId})`);
+      __stepStart = now;
+    };
+
     // 2) Upsert course — include[]=term to resolve actual year/semester per
     // course instead of writing the hardcoded TERM_YEAR/TERM_SEMESTER for
     // every course regardless of what term it's actually in.
-    const courseDetails = await canvasRequest(`courses/${courseId}`);
+    const courseDetails = await canvasRequest(`courses/${courseId}?include[]=term`);
+    step('canvasRequest courses/:id?include[]=term');
     const courseName = courseDetails?.data?.name || `Course ${courseId}`;
     const termName = courseDetails?.data?.term?.name || null;
     const parsedTerm = parseTermName(termName);
@@ -381,10 +392,13 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
       [courseId, courseName, courseYear, courseSemester, 'active']
     );
     const dbCourseId = courseUpsert.rows[0].id;
+    step('course upsert (DB)');
 
     // 3) Roster from enrollments (authoritative for status + grade + user)
     const enrollments = await getCourseEnrollments(courseId);
+    step(`getCourseEnrollments (${enrollments.length} rows)`);
     const sectionMap = await buildSectionMap(courseId);
+    step('buildSectionMap');
 
     const statusCounts = enrollments.reduce((acc, e) => {
       const s = e.enrollment_state || e.state || 'unknown';
@@ -397,6 +411,7 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     const allAssignments = await getAllPages(
       `${CANVAS_API_BASE}/api/v1/courses/${courseId}/assignments?per_page=100`
     );
+    step(`allAssignments fetch (${allAssignments.length} assignments)`);
     const quizExamAssignmentIds = new Set(
       allAssignments
         .filter(a => a.points_possible > 0 && isQuizExamGroup(a.name))
@@ -418,7 +433,7 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
           `${CANVAS_API_BASE}/api/v1/courses/${courseId}/students/submissions` +
           `?student_ids[]=all&${idParams}&per_page=100`
         );
-        
+
         for (const sub of submissions) {
           if (sub.missing) {
             missingByUserId[sub.user_id] = (missingByUserId[sub.user_id] || 0) + 1;
@@ -431,6 +446,7 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     } catch (err) {
       console.error(`Failed to compute missing assignments for course ${courseId}:`, err.message);
     }
+    step('missingByUserId bulk computation');
 
     // 3d) Fetch quiz/exam scores ONCE for all students — replaces the
     // per-student `analytics/users/{uid}/assignments` call that used to run
@@ -438,7 +454,7 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     // debugging; at 800 students that's ~6,400s sequential, well past any
     // Lambda timeout. This computes the same thing from one bulk call using
     // the same students/submissions endpoint as 3c above, joined against the
-    // already-fetched allAssignments for points_possible
+    // already-fetched allAssignments for points_possible.
     let quizScoreByUserId = {};
     try {
       if (quizExamAssignmentIds.size) {
@@ -448,7 +464,7 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
           `${CANVAS_API_BASE}/api/v1/courses/${courseId}/students/submissions` +
           `?student_ids[]=all&${idParams}&per_page=100`
         );
- 
+
         const earnedByUser = {};
         const possibleByUser = {};
         for (const sub of quizSubmissions) {
@@ -457,11 +473,11 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
           if (sub.score == null) continue;
           const possible = pointsByAssignmentId.get(sub.assignment_id);
           if (typeof possible !== 'number' || possible <= 0) continue;
- 
+
           earnedByUser[sub.user_id] = (earnedByUser[sub.user_id] || 0) + sub.score;
           possibleByUser[sub.user_id] = (possibleByUser[sub.user_id] || 0) + possible;
         }
- 
+
         for (const uid of Object.keys(possibleByUser)) {
           const earned = earnedByUser[uid] || 0;
           const possible = possibleByUser[uid];
@@ -474,6 +490,7 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     } catch (err) {
       console.error(`Failed to compute quiz/exam scores for course ${courseId}:`, err.message);
     }
+    step('quizScoreByUserId bulk computation');
 
     // 4) Process each enrolled student — collect first, then bulk-write.
     // Previously: ensureStudent() (2 round trips) + 1 analytics Canvas call
@@ -481,7 +498,20 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     // was ~1,600 DB round trips plus ~6,400s of Canvas calls. Now: 0 Canvas
     // calls here (quizScoreByUserId/missingByUserId already computed above
     // in bulk), and DB writes batched into a handful of multi-row queries.
-    const rosterRows = [];
+    //
+    // IMPORTANT: Canvas's Enrollments API returns one row PER ENROLLMENT,
+    // not per student — a student can appear more than once (cross-listed
+    // sections, or overlapping active/inactive/completed enrollment
+    // records, since getCourseEnrollments requests all of those states).
+    // The old sequential ensureStudent() calls tolerated duplicate
+    // canvas_user_ids fine (each was its own SQL statement). The bulk
+    // multi-row upsert cannot — Postgres rejects an ON CONFLICT DO UPDATE
+    // that would touch the same conflict-target row twice in one
+    // statement ("ON CONFLICT DO UPDATE command cannot affect row a
+    // second time"). Dedupe by user_id first, keeping the LAST enrollment
+    // record seen per student, which reproduces the old sequential
+    // "last one processed wins" precedence.
+    const rosterRowsByUserId = new Map();
     for (const enr of enrollments) {
       const uid = enr.user_id;
       if (!uid) continue;
@@ -498,8 +528,9 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
       const quizScore = quizScoreByUserId[uid] ?? null;
       const missing = missingByUserId[uid] ?? null;
 
-      rosterRows.push({ userId: uid, name, status, integrationId, sectionNumber, currentScore, quizScore, missing });
+      rosterRowsByUserId.set(uid, { userId: uid, name, status, integrationId, sectionNumber, currentScore, quizScore, missing });
     }
+    const rosterRows = [...rosterRowsByUserId.values()];
 
     const studentIdByUserId = await ensureStudentsBulk(client, rosterRows, dbCourseId);
 
@@ -515,14 +546,23 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
           missing: r.missing,
         }))
     );
+    step(`roster bulk upsert + snapshots (${rosterRows.length} students)`);
 
     // Lab courses: current_score + missing handled separately (different course shell)
     await seedLabData(client, dbCourseId);
+    step('seedLabData');
 
     // 5) Reflection survey quizzes
     const unpublished = [];
     const quizzes = await getQuizzesByCourseId(courseId);
+    step(`getQuizzesByCourseId (${quizzes.length} reflection quizzes)`);
 
+    // 5a) Upsert every quiz row + fetch its questions first (cheap — DB
+    // writes and small per-quiz question-definition fetches, NOT the
+    // submissions themselves). Build lookup maps keyed by assignment_id so
+    // the bulk submissions fetch below can be done ONCE across every quiz.
+    const dbQuizIdByAssignmentId = {};
+    const allQuestionsByAssignmentId = {};
     for (const quiz of quizzes) {
       if (quiz.published === false) {
         unpublished.push({
@@ -545,7 +585,7 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
          RETURNING id`,
         [quiz.id, quiz.assignment_id, dbCourseId, quiz.title, quiz.due_at]
       );
-      const dbQuizId = quizUpsert.rows[0].id;
+      dbQuizIdByAssignmentId[quiz.assignment_id] = quizUpsert.rows[0].id;
       console.log(
         'Quiz:', quiz.title,
         'published=', quiz.published,
@@ -556,147 +596,178 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
 
       // Fetch quiz questions for answer-id -> text mapping
       const questionRes = await canvasRequest(`courses/${courseId}/quizzes/${quiz.id}/questions`);
-      const allQuestions = questionRes?.data || [];
+      allQuestionsByAssignmentId[quiz.assignment_id] = questionRes?.data || [];
+    }
+    step(`quiz upserts + questions fetch (${quizzes.length} quizzes)`);
 
-      // 6) Submissions filtered to time window
-      let submissions = [];
+    // 5b) ONE bulk submissions fetch across ALL reflection quizzes, instead
+    // of one call PER quiz. Two problems this fixes:
+    //   1. The single-assignment submissions endpoint used previously has NO
+    //      date-filter parameter at all (confirmed against Canvas's own
+    //      controller source) — every run pulled the ENTIRE semester's
+    //      submission_history for every past quiz, then threw almost all of
+    //      it away in a JS filter. That gets worse every week as more
+    //      reflection quizzes accumulate.
+    //   2. It ran sequentially, one quiz at a time.
+    // The bulk multi-assignment endpoint (same one already used for
+    // missingByUserId/quizScoreByUserId above) DOES support a real
+    // server-side `submitted_since` filter, confirmed against Canvas's
+    // actual controller source (submissions_api_controller.rb, `for_students`
+    // action) — and supports include[]=submission_history too.
+    // Canvas requires this as a UTC "Z" timestamp, not the offset-form ISO
+    // string resolveWindow produces, so convert before sending.
+    const reflectionAssignmentIds = quizzes.map((q) => q.assignment_id).filter(Boolean);
+    let allReflectionSubmissions = [];
+    if (reflectionAssignmentIds.length) {
+      const idParams = reflectionAssignmentIds.map((id) => `assignment_ids[]=${id}`).join('&');
+      const submittedSinceUTC = DateTime.fromISO(sISO).toUTC().toISO();
       try {
-        // per_page=100 — same reasoning as getCourseEnrollments: at 800
-        // submissions on a deadline day this is 8 pages instead of 80.
-        submissions = await getAllPages(
-          `${CANVAS_API_BASE}/api/v1/courses/${courseId}/assignments/${quiz.assignment_id}/submissions?include[]=submission_history&per_page=100`
+        allReflectionSubmissions = await getAllPages(
+          `${CANVAS_API_BASE}/api/v1/courses/${courseId}/students/submissions` +
+          `?student_ids[]=all&${idParams}&include[]=submission_history` +
+          `&submitted_since=${encodeURIComponent(submittedSinceUTC)}&per_page=100`
         );
       } catch (err) {
-        console.error(`Failed to retrieve submissions for quiz assignment ${quiz.assignment_id}:`, err.message);
+        console.error(`Failed to retrieve reflection submissions for course ${courseId}:`, err.message);
+      }
+    }
+    step(`reflection submissions bulk fetch (${allReflectionSubmissions.length} rows across ${reflectionAssignmentIds.length} quizzes)`);
+
+    // submitted_since is a lower bound only (no upper-bound param exists on
+    // this endpoint) — keep the JS window filter as the source of truth for
+    // the exact [sISO, uISO) window; the server-side filter above is purely
+    // a payload-size optimization, not a correctness dependency.
+    const sTs = DateTime.fromISO(sISO);
+    const uTs = DateTime.fromISO(uISO);
+    const windowedSubmissions = allReflectionSubmissions.filter((sub) => {
+      if (!sub?.submitted_at) return false;
+      const t = DateTime.fromISO(sub.submitted_at);
+      return t.isValid && t >= sTs && t < uTs;
+    });
+
+    // Resolve students for these submissions in bulk, ONCE across every
+    // quiz. Almost every submitter is already in studentIdByUserId from the
+    // roster upsert above — only students NOT in current enrollments (rare)
+    // need a one-off lookup + ensureStudent() call.
+    const submitterIds = [...new Set(windowedSubmissions.map((s) => s.user_id).filter(Boolean))];
+    const unresolvedIds = submitterIds.filter((uid) => !(uid in studentIdByUserId));
+    for (const uid of unresolvedIds) {
+      const enr = enrollments.find(e => e.user_id === uid);
+      let name = null;
+      if (enr) {
+        name = enr.user?.name || enr.user?.short_name || null;
+      } else {
+        const userDetails = await canvasRequest(`courses/${courseId}/users/${uid}`);
+        const student = userDetails?.data || {};
+        name = student.name || null;
+      }
+      const dbStudentId = await ensureStudent(client, {
+        userId: uid,
+        name,
+        dbCourseId,
+        status: enr ? (enr.enrollment_state || enr.state || 'active') : 'active',
+      });
+      studentIdByUserId[uid] = dbStudentId;
+    }
+    step(`resolve unresolved submitters (${unresolvedIds.length})`);
+
+    // Bulk upsert quiz_submissions across ALL quizzes at once, chunked,
+    // RETURNING id in the same round trip (no separate SELECT needed).
+    const submissionIdByCanvasId = {};
+    for (const chunk of chunkArray(windowedSubmissions, 500)) {
+      const values = [];
+      const params = [];
+      let p = 1;
+      for (const sub of chunk) {
+        const dbStudentId = studentIdByUserId[sub.user_id];
+        const dbQuizId = dbQuizIdByAssignmentId[sub.assignment_id];
+        if (!dbStudentId || !dbQuizId) continue;
+        values.push(`($${p++}, $${p++}, $${p++}, $${p++})`);
+        params.push(sub.id, dbQuizId, dbStudentId, sub.submitted_at);
+      }
+      if (!values.length) continue;
+      const { rows } = await client.query(
+        `INSERT INTO quiz_submissions (canvas_submission_id, quiz_id, user_id, submitted_at)
+         VALUES ${values.join(',')}
+         ON CONFLICT (canvas_submission_id) DO UPDATE
+           SET quiz_id      = EXCLUDED.quiz_id,
+               user_id      = EXCLUDED.user_id,
+               submitted_at = GREATEST(quiz_submissions.submitted_at, EXCLUDED.submitted_at)
+         RETURNING id, canvas_submission_id`,
+        params
+      );
+      for (const row of rows) submissionIdByCanvasId[row.canvas_submission_id] = row.id;
+    }
+    step(`quiz_submissions bulk upsert (${windowedSubmissions.length} submissions)`);
+
+    // Parse answers + compute scores in memory (CPU only, no round trips),
+    // collecting every question_scores row across ALL submissions for ALL
+    // quizzes, then write them in a few chunked bulk inserts at the end.
+    const allScoreRows = [];
+    for (const submission of windowedSubmissions) {
+      const dbSubmissionId = submissionIdByCanvasId[submission.id];
+      if (!dbSubmissionId) {
+        console.warn('quiz_submissions row not found after bulk upsert; skipping question_scores', submission.id);
         continue;
       }
 
-      const sTs = DateTime.fromISO(sISO);
-      const uTs = DateTime.fromISO(uISO);
-      submissions = submissions.filter((sub) => {
-        if (!sub?.submitted_at) return false;
-        const t = DateTime.fromISO(sub.submitted_at);
-        return t.isValid && t >= sTs && t < uTs;
-      });
+      const allQuestions = allQuestionsByAssignmentId[submission.assignment_id] || [];
 
-      // Resolve students for these submissions in bulk. Almost every
-      // submitter is already in studentIdByUserId from the roster upsert
-      // above — only students NOT in current enrollments (rare) need a
-      // one-off lookup + ensureStudent() call, same as before.
-      const submitterIds = [...new Set(submissions.map((s) => s.user_id).filter(Boolean))];
-      const unresolvedIds = submitterIds.filter((uid) => !(uid in studentIdByUserId));
-      
-      for (const uid of unresolvedIds) {
-        const enr = enrollments.find(e => e.user_id === uid);
-        let name = null;
-        if (enr) {
-          name = enr.user?.name || enr.user?.short_name || null;
-        } else {
-          const userDetails = await canvasRequest(`courses/${courseId}/users/${uid}`);
-          const student = userDetails?.data || {};
-          name = student.name || null;
-        }
-        const dbStudentId = await ensureStudent(client, {
-          userId: uid,
-          name,
-          dbCourseId,
-          status: enr ? (enr.enrollment_state || enr.state || 'active') : 'active',
-        });
-        studentIdByUserId[uid] = dbStudentId;
-      }
+      const history = submission.submission_history || [];
+      const submissionData = history[0]?.submission_data;
+      if (!Array.isArray(submissionData)) continue;
 
-      // Bulk upsert quiz_submissions, chunked, RETURNING id in the same
-      // round trip (no separate SELECT needed to look the id back up).
-      const submissionIdByCanvasId = {};
-      for (const chunk of chunkArray(submissions, 500)) {
-        const values = [];
-        const params = [];
-        let p = 1;
-        for (const sub of chunk) {
-          const dbStudentId = studentIdByUserId[sub.user_id];
-          if (!dbStudentId) continue;
-          values.push(`($${p++}, $${p++}, $${p++}, $${p++})`);
-          params.push(sub.id, dbQuizId, dbStudentId, sub.submitted_at);
-        }
-        if (!values.length) continue;
-        const { rows } = await client.query(
-          `INSERT INTO quiz_submissions (canvas_submission_id, quiz_id, user_id, submitted_at)
-           VALUES ${values.join(',')}
-           ON CONFLICT (canvas_submission_id) DO UPDATE
-             SET quiz_id      = EXCLUDED.quiz_id,
-                 user_id      = EXCLUDED.user_id,
-                 submitted_at = GREATEST(quiz_submissions.submitted_at, EXCLUDED.submitted_at)
-           RETURNING id, canvas_submission_id`,
-          params
-        );
-        for (const row of rows) submissionIdByCanvasId[row.canvas_submission_id] = row.id;
-      }
- 
-      // Parse answers + compute scores in memory (CPU only, no round trips),
-      // collecting every question_scores row across ALL submissions for this
-      // quiz, then write them in a few chunked bulk inserts at the end.
-      const allScoreRows = [];
-      for (const submission of submissions) {
-        const dbSubmissionId = submissionIdByCanvasId[submission.id];
-        if (!dbSubmissionId) {
-          console.warn('quiz_submissions row not found after bulk upsert; skipping question_scores', submission.id);
-          continue;
-        }
- 
-        const history = submission.submission_history || [];
-        const submissionData = history[0]?.submission_data;
-        if (!Array.isArray(submissionData)) continue;
- 
-        const parsedAnswers = [];
-        for (const resp of submissionData) {
-          const qid = resp.question_id;
-          const q = allQuestions.find((x) => x.id === qid);
-          if (!q || q.question_type !== 'multiple_dropdowns_question') continue;
- 
-          const answerTexts = {};
-          for (const key in resp) {
-            if (key.startsWith('answer_id_for_')) {
-              const blankId  = key.replace('answer_id_for_', '');
-              const answerId = resp[key];
-              const matched  = (q.answers || []).find(
-                (opt) => opt.id === answerId && opt.blank_id === blankId
-              );
-              answerTexts[blankId] = matched ? matched.text : '[Unknown]';
-            }
-          }
-          parsedAnswers.push({ questionId: qid, answers: answerTexts });
-        }
- 
-        const userScores = extractQuizScoresByUser([
-          { submissionId: dbSubmissionId, studentId: studentIdByUserId[submission.user_id], answers: parsedAnswers },
-        ]);
- 
-        for (const { submissionId, scores } of userScores) {
-          for (const [code, score] of Object.entries(scores)) {
-            const questionId = codeToQuestionId[code];
-            if (!questionId) continue;
-            allScoreRows.push({ submissionId, questionId, score });
+      const parsedAnswers = [];
+      for (const resp of submissionData) {
+        const qid = resp.question_id;
+        const q = allQuestions.find((x) => x.id === qid);
+        if (!q || q.question_type !== 'multiple_dropdowns_question') continue;
+
+        const answerTexts = {};
+        for (const key in resp) {
+          if (key.startsWith('answer_id_for_')) {
+            const blankId  = key.replace('answer_id_for_', '');
+            const answerId = resp[key];
+            const matched  = (q.answers || []).find(
+              (opt) => opt.id === answerId && opt.blank_id === blankId
+            );
+            answerTexts[blankId] = matched ? matched.text : '[Unknown]';
           }
         }
+        parsedAnswers.push({ questionId: qid, answers: answerTexts });
       }
- 
-      for (const chunk of chunkArray(allScoreRows, 1000)) {
-        const values = [];
-        const params = [];
-        let p = 1;
-        for (const row of chunk) {
-          values.push(`($${p++}, $${p++}, $${p++})`);
-          params.push(row.submissionId, row.questionId, row.score);
+
+      const userScores = extractQuizScoresByUser([
+        { submissionId: dbSubmissionId, studentId: studentIdByUserId[submission.user_id], answers: parsedAnswers },
+      ]);
+
+      for (const { submissionId, scores } of userScores) {
+        for (const [code, score] of Object.entries(scores)) {
+          const questionId = codeToQuestionId[code];
+          if (!questionId) continue;
+          allScoreRows.push({ submissionId, questionId, score });
         }
-        await client.query(
-          `INSERT INTO question_scores (submission_id, question_id, score)
-           VALUES ${values.join(',')}
-           ON CONFLICT DO NOTHING`,
-          params
-        );
       }
     }
- 
+    step(`parse answers + compute scores (${allScoreRows.length} score rows)`);
+
+    for (const chunk of chunkArray(allScoreRows, 1000)) {
+      const values = [];
+      const params = [];
+      let p = 1;
+      for (const row of chunk) {
+        values.push(`($${p++}, $${p++}, $${p++})`);
+        params.push(row.submissionId, row.questionId, row.score);
+      }
+      await client.query(
+        `INSERT INTO question_scores (submission_id, question_id, score)
+         VALUES ${values.join(',')}
+         ON CONFLICT DO NOTHING`,
+        params
+      );
+    }
+    step('question_scores bulk insert');
+
     if (unpublished.length) {
       const lines = unpublished.map(x =>
         `- ${x.courseId},${x.title},unlock=${x.unlock_at},lock=${x.lock_at},due=${x.due_at}`
@@ -706,8 +777,10 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
         text: `Found ${unpublished.length} unpublished quiz(es) while seeding.\nCourse: ${courseId}\n${lines}`,
       });
     }
- 
+    step('sendAlertEmail (if any unpublished)');
+
     await client.query('COMMIT');
+    step('COMMIT');
   } catch (err) {
     console.error('Error seeding quiz data:', err);
     await client.query('ROLLBACK');
@@ -716,5 +789,5 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     client.release();
   }
 }
- 
+
 module.exports = { seedQuiz };
