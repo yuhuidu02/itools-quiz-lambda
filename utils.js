@@ -65,12 +65,45 @@ const CODE_TYPE_MAP = {
 const CANVAS_API_BASE = process.env.LTI_PLATFORM_URL
 const CANVAS_TOKEN = process.env.CANVAS_TOKEN
 
-const QUIZ_EXAM_INCLUDE = /\b(exam|quiz|quizes|test|midterm|final)\b/i;
-const QUIZ_EXAM_EXCLUDE = /\b(reflection|syllabus|not counted|final grades)\b/i;
- 
+// const QUIZ_EXAM_INCLUDE = /\b(exam|quiz|quizes|test|midterm)\b/i;
+// const QUIZ_EXAM_EXCLUDE = /\b(reflection|syllabus|not counted|final grades)\b/i;
+
+// function isQuizExamGroup(name) {
+//     const n = name.trim();
+//     return QUIZ_EXAM_INCLUDE.test(n) && !QUIZ_EXAM_EXCLUDE.test(n);
+// }
+
+/* ---- Revised quiz/exam group detection logic ---- */
+// Layer 1: Base classification — does the name contain quiz/exam-type language?
+const QUIZ_EXAM_INCLUDE = /\b(exam|quiz|quizzes|test|midterm|final exam)\b/i;
+
+// Layer 2: Modifiers that indicate the item is NOT actually a graded assessment,
+// even though it matched Layer 1 (e.g. practice quizzes, ungraded reflections).
+const NON_GRADED_MODIFIERS = /\b(practice|sample|ungraded|ungraded quiz|ptactice|not counted|no credit)\b/i;
+
+// Layer 2: Modifiers that indicate the item should be excluded outright,
+// regardless of Layer 1 — e.g. administrative groups that aren't assessments.
+const HARD_EXCLUDE = /\b(reflection|final grades)\b/i;
+
 function isQuizExamGroup(name) {
     const n = name.trim();
-    return QUIZ_EXAM_INCLUDE.test(n) && !QUIZ_EXAM_EXCLUDE.test(n);
+
+    // Layer 1: must look like a quiz/exam to even be considered
+    if (!QUIZ_EXAM_INCLUDE.test(n)) {
+        return false;
+    }
+
+    // Layer 2a: hard excludes always win, even over a Layer 1 match
+    if (HARD_EXCLUDE.test(n)) {
+        return false;
+    }
+
+    // Layer 2b: modifiers that suggest it's not a "real" graded assessment
+    if (NON_GRADED_MODIFIERS.test(n)) {
+        return false;
+    }
+
+    return true;
 }
 
 const http = axiosBase.create({
@@ -125,6 +158,8 @@ function logRequest(method, url) {
     console.log(`[Canvas API] ${method} ${full}`);
 }
 
+const CANVAS_REQUEST_TIMEOUT_MS = 20000; // fail loudly after 20s instead of hanging silently for the rest of the Lambda's budget
+
 const canvasRequest = async (endpoint, method = 'GET', data = {}, opts = {}) => {
     const { maxRetries = 8 } = opts;
 
@@ -141,6 +176,7 @@ const canvasRequest = async (endpoint, method = 'GET', data = {}, opts = {}) => 
                 method,
                 url,
                 headers: { Authorization: `Bearer ${CANVAS_TOKEN}` },
+                timeout: CANVAS_REQUEST_TIMEOUT_MS,
             };
 
             if (method.toUpperCase() !== 'GET') config.data = data;
@@ -148,6 +184,8 @@ const canvasRequest = async (endpoint, method = 'GET', data = {}, opts = {}) => 
             return await axiosBase(config);
         } catch (err) {
             const status = err.response?.status;
+            const isTimeout = err.code === 'ECONNABORTED' || /timeout/i.test(err.message || '');
+
             if (status === 429 && attempt < maxRetries) {
                 const headerWait = getWaitMsFromHeaders(err.response?.headers || {});
                 const backoffWait = 1000 * Math.pow(2, attempt); // exponential backoff
@@ -160,6 +198,21 @@ const canvasRequest = async (endpoint, method = 'GET', data = {}, opts = {}) => 
                 attempt++;
                 continue;
             }
+
+            if (isTimeout && attempt < maxRetries) {
+                const waitMs = 1000 * Math.pow(2, attempt);
+                console.warn(
+                    `[Canvas API] Request TIMED OUT after ${CANVAS_REQUEST_TIMEOUT_MS}ms: ${method} ${url} — retrying in ${waitMs}ms (attempt ${attempt + 1}/${maxRetries})`
+                );
+                await sleep(waitMs);
+                attempt++;
+                continue;
+            }
+
+            if (isTimeout) {
+                console.error(`[Canvas API] Request TIMED OUT after ${CANVAS_REQUEST_TIMEOUT_MS}ms and exhausted retries: ${method} ${url}`);
+            }
+
             throw err;      
         }
     }
@@ -323,7 +376,7 @@ function parseTermName(termName) {
  
     return { year, semester };
 }
-    
+
 module.exports = {
     isQuizExamGroup,
     canvasRequest,
