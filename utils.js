@@ -79,7 +79,7 @@ const QUIZ_EXAM_INCLUDE = /\b(exam|quiz|quizzes|test|midterm|final exam)\b/i;
 
 // Layer 2: Modifiers that indicate the item is NOT actually a graded assessment,
 // even though it matched Layer 1 (e.g. practice quizzes, ungraded reflections).
-const NON_GRADED_MODIFIERS = /\b(practice|sample|ungraded|ungraded quiz|ptactice|not counted|no credit|Not for points)\b/i;
+const NON_GRADED_MODIFIERS = /\b(practice|sample|ungraded|ungraded quiz|not counted|no credit|Not for points)\b/i;
 
 // Layer 2: Modifiers that indicate the item should be excluded outright,
 // regardless of Layer 1 — e.g. administrative groups that aren't assessments.

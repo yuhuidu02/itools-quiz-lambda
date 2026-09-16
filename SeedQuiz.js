@@ -82,7 +82,7 @@ function resolveWindow(sinceISO, untilISO, now = DateTime.now().setZone(PT_ZONE)
   };
 }
 
-const MISSING_ASSIGNMENT_EXCLUDE = /\b(reflection|syllabus|not counted|final grades|extra credit|survey|not for points)\b/i;
+const MISSING_ASSIGNMENT_EXCLUDE = /\b(reflection|not counted|final grades|extra credit|survey|not for points)\b/i;
 
 function countsTowardMissing(assignment) {
   return assignment.points_possible > 0 && !MISSING_ASSIGNMENT_EXCLUDE.test(assignment.name);
