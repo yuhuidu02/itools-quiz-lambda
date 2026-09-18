@@ -85,7 +85,7 @@ function resolveWindow(sinceISO, untilISO, now = DateTime.now().setZone(PT_ZONE)
 const MISSING_ASSIGNMENT_EXCLUDE = /\b(reflection|not counted|final grades|extra credit|survey|not for points)\b/i;
 
 function countsTowardMissing(assignment) {
-  return assignment.points_possible > 0 && !MISSING_ASSIGNMENT_EXCLUDE.test(assignment.name);
+  return assignment.published === true && assignment.points_possible > 0 && !MISSING_ASSIGNMENT_EXCLUDE.test(assignment.name);
 }
 
 async function seedQuestionsOnce() {
@@ -414,7 +414,7 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
     step(`allAssignments fetch (${allAssignments.length} assignments)`);
     const quizExamAssignmentIds = new Set(
       allAssignments
-        .filter(a => a.points_possible > 0 && isQuizExamGroup(a.name))
+        .filter(a => a.published === true && a.points_possible > 0 && isQuizExamGroup(a.name))
         .map(a => a.id)
     );
     console.log(`Found ${quizExamAssignmentIds.size} quiz/exam assignments for course ${courseId}`);
