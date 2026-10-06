@@ -182,15 +182,14 @@ async function ensureStudentsBulk(client, students, dbCourseId, chunkSize = 500)
     let p = 1;
     for (const s of chunk) {
       sValues.push(`($${p++}, $${p++}, $${p++}, $${p++})`);
-      sParams.push(s.userId, s.name || '', s.integrationId || null, s.sisSectionId || null);
+      sParams.push(s.userId, s.name || '', s.integrationId || null);
     }
     const { rows: studentRows } = await client.query(
-      `INSERT INTO students (canvas_user_id, name, integration_id, sis_section_id)
+      `INSERT INTO students (canvas_user_id, name, integration_id)
        VALUES ${sValues.join(',')}
        ON CONFLICT (canvas_user_id) DO UPDATE
          SET name = EXCLUDED.name,
-             integration_id = COALESCE(EXCLUDED.integration_id, students.integration_id),
-             sis_section_id = COALESCE(EXCLUDED.sis_section_id, students.sis_section_id)
+             integration_id = COALESCE(EXCLUDED.integration_id, students.integration_id)
        RETURNING id, canvas_user_id`,
       sParams
     );
@@ -201,15 +200,16 @@ async function ensureStudentsBulk(client, students, dbCourseId, chunkSize = 500)
     p = 1;
     for (const s of chunk) {
       const dbStudentId = studentIdByUserId[s.userId];
-      scValues.push(`($${p++}, $${p++}, $${p++}, $${p++})`);
-      scParams.push(dbStudentId, dbCourseId, s.status || 'active', s.sectionNumber || null);
+      scValues.push(`($${p++}, $${p++}, $${p++}, $${p++}, $${p++})`);
+      scParams.push(dbStudentId, dbCourseId, s.status || 'active', s.sectionNumber || null, s.sisSectionId || null);
     }
     await client.query(
-      `INSERT INTO student_courses (student_id, course_id, status, section_number)
+      `INSERT INTO student_courses (student_id, course_id, status, section_number, sis_section_id)
        VALUES ${scValues.join(',')}
        ON CONFLICT (student_id, course_id) DO UPDATE
          SET status = EXCLUDED.status,
-             section_number = COALESCE(EXCLUDED.section_number, student_courses.section_number)`,
+             section_number = COALESCE(EXCLUDED.section_number, student_courses.section_number),
+             sis_section_id = COALESCE(EXCLUDED.sis_section_id, student_courses.sis_section_id)`,
       scParams
     );
   }
