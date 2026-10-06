@@ -181,15 +181,16 @@ async function ensureStudentsBulk(client, students, dbCourseId, chunkSize = 500)
     const sValues = [];
     let p = 1;
     for (const s of chunk) {
-      sValues.push(`($${p++}, $${p++}, $${p++})`);
-      sParams.push(s.userId, s.name || '', s.integrationId || null);
+      sValues.push(`($${p++}, $${p++}, $${p++}, $${p++})`);
+      sParams.push(s.userId, s.name || '', s.integrationId || null, s.sisSectionId || null);
     }
     const { rows: studentRows } = await client.query(
-      `INSERT INTO students (canvas_user_id, name, integration_id)
+      `INSERT INTO students (canvas_user_id, name, integration_id, sis_section_id)
        VALUES ${sValues.join(',')}
        ON CONFLICT (canvas_user_id) DO UPDATE
          SET name = EXCLUDED.name,
-             integration_id = COALESCE(EXCLUDED.integration_id, students.integration_id)
+             integration_id = COALESCE(EXCLUDED.integration_id, students.integration_id),
+             sis_section_id = COALESCE(EXCLUDED.sis_section_id, students.sis_section_id)
        RETURNING id, canvas_user_id`,
       sParams
     );
@@ -257,7 +258,7 @@ async function buildSectionMap(courseId) {
   for (const section of sections) {
     const sectionNumber = section.sis_section_id?.match(/SEC(\d+)/)?.[1] || null;
     for (const student of (section.students || [])) {
-      userToSection[student.id] = sectionNumber;
+      userToSection[student.id] = { sectionNumber, sisSectionId: section.sis_section_id || null };
     }
   }
   return userToSection;
@@ -525,10 +526,11 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
         enr.enrollment_state === 'active'
       ) ? enr.grades.current_score : null;
       const sectionNumber = sectionMap[uid] || null;
+      const sisSectionId = sectionMap[uid]?.sisSectionId || null;
       const quizScore = quizScoreByUserId[uid] ?? null;
       const missing = missingByUserId[uid] ?? null;
 
-      rosterRowsByUserId.set(uid, { userId: uid, name, status, integrationId, sectionNumber, currentScore, quizScore, missing });
+      rosterRowsByUserId.set(uid, { userId: uid, name, status, integrationId, sectionNumber, sisSectionId, currentScore, quizScore, missing });
     }
     const rosterRows = [...rosterRowsByUserId.values()];
 
