@@ -181,7 +181,7 @@ async function ensureStudentsBulk(client, students, dbCourseId, chunkSize = 500)
     const sValues = [];
     let p = 1;
     for (const s of chunk) {
-      sValues.push(`($${p++}, $${p++}, $${p++}, $${p++})`);
+      sValues.push(`($${p++}, $${p++}, $${p++}`);
       sParams.push(s.userId, s.name || '', s.integrationId || null);
     }
     const { rows: studentRows } = await client.query(
@@ -525,7 +525,7 @@ async function seedQuiz(courseId, sinceISO, untilISO) {
         typeof enr.grades.current_score === 'number' &&
         enr.enrollment_state === 'active'
       ) ? enr.grades.current_score : null;
-      const sectionNumber = sectionMap[uid] || null;
+      const sectionNumber = sectionMap[uid]?.sectionNumber || null;
       const sisSectionId = sectionMap[uid]?.sisSectionId || null;
       const quizScore = quizScoreByUserId[uid] ?? null;
       const missing = missingByUserId[uid] ?? null;
