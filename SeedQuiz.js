@@ -181,7 +181,7 @@ async function ensureStudentsBulk(client, students, dbCourseId, chunkSize = 500)
     const sValues = [];
     let p = 1;
     for (const s of chunk) {
-      sValues.push(`($${p++}, $${p++}, $${p++}`);
+      sValues.push(`($${p++}, $${p++}, $${p++})`);
       sParams.push(s.userId, s.name || '', s.integrationId || null);
     }
     const { rows: studentRows } = await client.query(
